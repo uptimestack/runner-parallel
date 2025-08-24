@@ -1,0 +1,257 @@
+name: Manage Runners
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_name:
+        description: "Select base runner name"
+        required: true
+        type: choice
+        options:
+          - MS_JDK_17
+          - DTS-Microservices
+      count:
+        description: "Number of runners to add/remove"
+        required: true
+        type: number
+        default: 1
+      operation:
+        description: "Add or Subtract"
+        required: true
+        type: choice
+        options:
+          - Add
+          - Subtract
+
+jobs:
+  manage:
+    # Run on that server's executor runner
+    runs-on: ${{ github.event.inputs.runner_name }}_Executor
+
+    steps:
+      - name: Set up variables
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RUNNER_NAME="${{ github.event.inputs.runner_name }}"
+          COUNT="${{ github.event.inputs.count }}"
+          OP="${{ github.event.inputs.operation }}"
+
+          echo "RUNNER_NAME=$RUNNER_NAME" >> "$GITHUB_ENV"
+          echo "COUNT=$COUNT" >> "$GITHUB_ENV"
+          echo "OP=$OP" >> "$GITHUB_ENV"
+
+          # org and repo info
+          echo "ORG=${{ github.repository_owner }}" >> "$GITHUB_ENV"
+
+      - name: Pre-flight checks (jq, curl, perms)
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null 2>&1 || { echo "ERROR: 'jq' is required on the executor host."; exit 1; }
+          command -v curl >/dev/null 2>&1 || { echo "ERROR: 'curl' is required on the executor host."; exit 1; }
+          # Check /mnt write access; if not, try sudo create a temp and chown back
+          if [ ! -w /mnt ]; then
+            if command -v sudo >/dev/null 2>&1; then
+              sudo -n bash -c "mkdir -p /mnt/.permcheck && rmdir /mnt/.permcheck" || {
+                echo "WARNING: No write access to /mnt and no passwordless sudo; creation may fail later."
+              }
+            else
+              echo "WARNING: No write access to /mnt and sudo not available; creation may fail later."
+            fi
+          fi
+
+      - name: Resolve base labels from existing runner
+        id: labels
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Try to read labels from the "base" runner (no suffix). If not found, fall back to _1.
+          # If still empty, fall back to using RUNNER_NAME as a single label.
+          BASE_JSON="$(curl -s -H "Authorization: token ${{ secrets.GH_PAT }}" \
+            "https://api.github.com/orgs/$ORG/actions/runners?per_page=100")"
+
+          LABELS=$(echo "$BASE_JSON" | jq -r ".runners[] | select(.name==\"$RUNNER_NAME\") | .labels[].name" | tr '\n' ',' | sed 's/,$//')
+          if [ -z "$LABELS" ]; then
+            LABELS=$(echo "$BASE_JSON" | jq -r ".runners[] | select(.name==\"${RUNNER_NAME}_1\") | .labels[].name" | tr '\n' ',' | sed 's/,$//')
+          fi
+          if [ -z "$LABELS" ]; then
+            LABELS="$RUNNER_NAME"
+          fi
+
+          echo "LABELS=$LABELS" >> "$GITHUB_ENV"
+          echo "Using labels: $LABELS"
+
+      - name: Add Runners (nohup run.sh, per-folder under /mnt)
+        if: env.OP == 'Add'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Adding $COUNT runner(s) for $RUNNER_NAME ..."
+
+          # Find the highest numeric suffix among repo runners for this base (e.g., MS_JDK_17_3 -> 3)
+          LAST_NUM=$(curl -s -H "Authorization: token ${{ secrets.GH_PAT }}" \
+            "https://api.github.com/orgs/$ORG/actions/runners?per_page=100" \
+            | jq -r ".runners[] | select(.name | startswith(\"$RUNNER_NAME\" + \"_\")) | .name" \
+            | grep -oE '[0-9]+$' | sort -n | tail -1)
+
+          if [ -z "${LAST_NUM:-}" ]; then
+            LAST_NUM=0
+          fi
+
+          for i in $(seq 1 "$COUNT"); do
+            NEW_NUM=$((LAST_NUM + i))
+            NEW_NAME="${RUNNER_NAME}_${NEW_NUM}"
+            RUNNER_DIR="/mnt/actions-runner_${NEW_NUM}"
+
+            echo ""
+            echo "==> Creating runner $NEW_NAME in $RUNNER_DIR"
+
+            # Create folder (try direct, else sudo)
+            if ! mkdir -p "$RUNNER_DIR" 2>/dev/null; then
+              if command -v sudo >/dev/null 2>&1; then
+                sudo -n mkdir -p "$RUNNER_DIR" || { echo "ERROR: Failed to create $RUNNER_DIR"; exit 1; }
+                sudo -n chown "$USER:$USER" "$RUNNER_DIR" || true
+              else
+                echo "ERROR: Cannot create $RUNNER_DIR and sudo not available"; exit 1
+              fi
+            fi
+            cd "$RUNNER_DIR"
+
+            # Download runner tar (exact version per your requirement)
+            echo "Downloading actions-runner 2.328.0 ..."
+            curl -fL -o actions-runner-linux-x64-2.328.0.tar.gz "https://github.com/actions/runner/releases/download/v2.328.0/actions-runner-linux-x64-2.328.0.tar.gz"
+            tar xzf ./actions-runner-linux-x64-2.328.0.tar.gz
+            rm -f actions-runner-linux-x64-2.328.0.tar.gz
+
+            # Get repo registration token
+            TOKEN=$(curl -sX POST -H "Authorization: token ${{ secrets.GH_PAT }}" \
+              "https://api.github.com/orgs/$ORG/actions/runners/registration-token" \
+              | jq -r .token)
+
+            if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+              echo "ERROR: Could not fetch registration token"; exit 1
+            fi
+
+            # Configure runner (Default group, _work dir, inherit labels)
+            ./config.sh --unattended \
+              --url "https://github.com/$ORG" \
+              --token "$TOKEN" \
+              --name "$NEW_NAME" \
+              --labels "$LABELS" \
+              --work _work
+
+            # Start using nohup (no systemd), stash PID for easier stop
+            nohup ./run.sh > "$RUNNER_DIR/runner.log" 2>&1 &
+            echo $! > "$RUNNER_DIR/.runner.pid"
+
+            echo "✅ Runner $NEW_NAME started (PID $(cat "$RUNNER_DIR/.runner.pid"))"
+          done
+
+      - name: Subtract Runners (stop, unregister, delete folder)
+        if: env.OP == 'Subtract'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Removing $COUNT runner(s) for $RUNNER_NAME ..."
+
+          # Get current runners for this base, descending by numeric suffix
+          RUNNERS=$(curl -s -H "Authorization: token ${{ secrets.GH_PAT }}" \
+            "https://api.github.com/orgs/$ORG/actions/runners?per_page=100" \
+            | jq -r ".runners[] | select(.name | startswith(\"$RUNNER_NAME\" + \"_\")) | .name" \
+            | grep -E "^${RUNNER_NAME}_[0-9]+$" \
+            | sort -t_ -k2 -nr)
+
+          if [ -z "${RUNNERS:-}" ]; then
+            echo "No runners found to remove for prefix $RUNNER_NAME_."
+            exit 0
+          fi
+
+          REMOVED=0
+          for R in $RUNNERS; do
+            [ "$REMOVED" -ge "$COUNT" ] && break
+
+            # Check busy status
+            BUSY=$(curl -s -H "Authorization: token ${{ secrets.GH_PAT }}" \
+              "https://api.github.com/orgs/$ORG/actions/runners?per_page=100" \
+              | jq -r ".runners[] | select(.name==\"$R\") | .busy")
+
+            if [ "$BUSY" = "true" ]; then
+              echo "⏭  $R is busy, skipping..."
+              continue
+            fi
+
+            NUM=$(echo "$R" | grep -oE '[0-9]+$')
+            RUNNER_DIR="/mnt/actions-runner_${NUM}"
+
+            echo ""
+            echo "==> Stopping and removing $R (dir: $RUNNER_DIR)"
+
+            # Try to stop background process gracefully
+            if [ -f "$RUNNER_DIR/.runner.pid" ]; then
+              PID=$(cat "$RUNNER_DIR/.runner.pid" || true)
+              if [ -n "${PID:-}" ] && ps -p "$PID" >/dev/null 2>&1; then
+                echo "Stopping PID $PID ..."
+                kill "$PID" || true
+                # Wait up to 10s, then force
+                for t in $(seq 1 10); do
+                  if ps -p "$PID" >/dev/null 2>&1; then
+                    sleep 1
+                  else
+                    break
+                  fi
+                done
+                if ps -p "$PID" >/dev/null 2>&1; then
+                  echo "Force killing PID $PID ..."
+                  kill -9 "$PID" || true
+                fi
+              fi
+            else
+              # Fallback: find Runner.Listener processes from this folder
+              PIDS=$(ps -eo pid,cmd | awk -v d="$RUNNER_DIR" '$0 ~ d && $0 ~ /Runner\.Listener/ {print $1}')
+              if [ -n "${PIDS:-}" ]; then
+                echo "Stopping detected Runner.Listener PID(s): $PIDS"
+                kill $PIDS || true
+                sleep 3
+                PIDS2=$(ps -eo pid,cmd | awk -v d="$RUNNER_DIR" '$0 ~ d && $0 ~ /Runner\.Listener/ {print $1}')
+                if [ -n "${PIDS2:-}" ]; then
+                  echo "Force killing PID(s): $PIDS2"
+                  kill -9 $PIDS2 || true
+                fi
+              fi
+            fi
+
+            # Unregister runner from GitHub (repo remove-token + config.sh remove)
+            if [ -x "$RUNNER_DIR/config.sh" ]; then
+              REMOVE_TOKEN=$(curl -sX POST -H "Authorization: token ${{ secrets.GH_PAT }}" \
+                "https://api.github.com/orgs/$ORG/actions/runners/remove-token" \
+                | jq -r .token)
+              if [ -n "$REMOVE_TOKEN" ] && [ "$REMOVE_TOKEN" != "null" ]; then
+                (cd "$RUNNER_DIR" && ./config.sh remove --unattended --token "$REMOVE_TOKEN") || true
+              else
+                echo "WARN: Could not fetch remove token; proceeding to delete folder."
+              fi
+            fi
+
+            # Delete runner directory (try direct, else sudo)
+            if [ -d "$RUNNER_DIR" ]; then
+              if rm -rf "$RUNNER_DIR" 2>/dev/null; then
+                :
+              elif command -v sudo >/dev/null 2>&1; then
+                sudo -n rm -rf "$RUNNER_DIR" || { echo "ERROR: Failed to delete $RUNNER_DIR"; exit 1; }
+              else
+                echo "ERROR: Cannot delete $RUNNER_DIR and sudo not available"; exit 1
+              fi
+            fi
+
+            echo "🗑  Removed $R and deleted $RUNNER_DIR"
+            REMOVED=$((REMOVED + 1))
+          done
+
+          if [ "$REMOVED" -lt "$COUNT" ]; then
+            echo "Warning: Only removed $REMOVED runner(s) (others were busy or not found)."
+          fi
