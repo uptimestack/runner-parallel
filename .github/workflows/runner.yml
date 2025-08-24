@@ -76,25 +76,33 @@ jobs:
           trap 'echo "❌ Failed at line $LINENO"; exit 1' ERR
           echo "Adding $COUNT runner(s) for base '$BASENAME' ..."
 
-          # Determine highest numeric suffix among BASENAME_* (ignore *_Executor)
+          # Fetch all runner names
           NAMES=$(curl -s -H "Authorization: token ${{ secrets.GH_PAT }}" \
             "https://api.github.com/orgs/$ORG/actions/runners?per_page=100" \
             | jq -r '.runners[].name')
-
-          LAST_NUM=$(echo "$NAMES" \
-            | grep -E "^${BASENAME}_[0-9]+$" \
-            | grep -oE '[0-9]+$' \
-            | sort -n | tail -1)
-
-          [ -z "${LAST_NUM:-}" ] && LAST_NUM=0
-
+          
+          # Case 1: existing runner without suffix (treat as _0)
+          if echo "$NAMES" | grep -q "^${BASENAME}$"; then
+            LAST_NUM=0
+          else
+            # Case 2: find highest numeric suffix among BASENAME_*
+            LAST_NUM=$(echo "$NAMES" \
+              | grep -E "^${BASENAME}_[0-9]+$" \
+              | grep -oE '[0-9]+$' \
+              | sort -n | tail -1)
+            [ -z "${LAST_NUM:-}" ] && LAST_NUM=0
+          fi
+          
+          # Create new runners incrementally
           for i in $(seq 1 "$COUNT"); do
             NEW_NUM=$((LAST_NUM + i))
             NEW_NAME="${BASENAME}_${NEW_NUM}"
             RUNNER_DIR="/mnt/actions-runner_${NEW_NUM}"
-
+          
             echo ""
             echo "==> Creating org runner '$NEW_NAME' in '$RUNNER_DIR' with labels: $LABELS"
+          done
+
 
             # Create dir (try direct, else sudo -n)
             if ! mkdir -p "$RUNNER_DIR" 2>/dev/null; then
@@ -223,3 +231,4 @@ jobs:
           if [ "$REMOVED" -lt "$COUNT" ]; then
             echo "Warning: Only removed $REMOVED runner(s) (others were busy or not found)."
           fi
+
