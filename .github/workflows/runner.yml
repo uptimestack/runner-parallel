@@ -225,15 +225,10 @@ jobs:
                 "https://api.github.com/orgs/$ORG/actions/runners/$RID" >/dev/null || true
             fi
 
-            # Stop and remove systemd service if it exists
-            SERVICE_NAME="actions.runner.${ORG}.${R}.service"
-            SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
-            
-            if systemctl list-unit-files | grep -q "$SERVICE_NAME"; then
-              echo "🛑 Stopping and removing systemd service $SERVICE_NAME"
-              sudo systemctl stop "$SERVICE_NAME" || true
-              sudo systemctl disable "$SERVICE_NAME" || true
-              sudo rm -f "$SERVICE_PATH" || true
+            if [ -x "$RUNNER_DIR/svc.sh" ]; then
+              echo "🛑 Stopping and uninstalling service for $R"
+              (cd "$RUNNER_DIR" && sudo ./svc.sh stop || true)
+              (cd "$RUNNER_DIR" && sudo ./svc.sh uninstall || true)
               sudo systemctl daemon-reload
               sudo systemctl reset-failed
             fi
@@ -250,6 +245,7 @@ jobs:
           if [ "$REMOVED" -lt "$COUNT" ]; then
             echo "Warning: Only removed $REMOVED runner(s) (others were busy or not found)."
           fi
+
 
 
 
