@@ -132,10 +132,18 @@ jobs:
               --labels "$LABELS" \
               --work _work
 
-            # Start without systemd
-            nohup ./run.sh > "$RUNNER_DIR/runner.log" 2>&1 &
-            echo $! > "$RUNNER_DIR/.runner.pid"
-            echo "✅ Started $NEW_NAME (PID $(cat "$RUNNER_DIR/.runner.pid"))"
+            # Install systemd service for this runner
+            sudo ./svc.sh install
+            
+            # Enable it to start on boot
+            sudo systemctl enable actions.runner.uptimestack.$NEW_NAME.service
+            
+            # Start the service now
+            sudo ./svc.sh start
+            
+            # Optionally, check status
+            sudo systemctl status actions.runner.uptimestack.$NEW_NAME.service
+            echo "✅ Runner $NEW_NAME installed as a systemd service and started."
           done
 
       - name: Subtract Runners (descending, skip busy, unregister, delete folder)
@@ -229,5 +237,6 @@ jobs:
           if [ "$REMOVED" -lt "$COUNT" ]; then
             echo "Warning: Only removed $REMOVED runner(s) (others were busy or not found)."
           fi
+
 
 
