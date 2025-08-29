@@ -22,7 +22,7 @@ on:
         options:
           - Add
           - Subtract
-          - Total
+          - View
 
 jobs:
   manage:
@@ -69,6 +69,26 @@ jobs:
           echo "LABELS=$LABELS" >> "$GITHUB_ENV"
           echo "Base labels: $LABELS"
 
+      - name: View Runners (list base + copies)
+        if: env.OP == 'View'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "📋 Viewing runners for base name '$BASENAME' ..."
+
+          JSON=$(curl -s -H "Authorization: token ${{ secrets.GH_PAT }}" \
+            "https://api.github.com/orgs/$ORG/actions/runners?per_page=100")
+
+          MATCHES=$(echo "$JSON" \
+            | jq -r ".runners[] | select(.name==\"$BASENAME\" or .name|startswith(\"$BASENAME\" + \"_\")) | \"- \(.name) (id:\(.id), busy:\(.busy), labels:\([.labels[].name]|join(\",\")))\"")
+
+          if [ -z "$MATCHES" ]; then
+            echo "⚠️  No runners found for base '$BASENAME'."
+            exit 0
+          fi
+
+          echo "Found runners:"
+          echo "$MATCHES"
       - name: Add Runners (org-level, nohup run.sh)
         if: env.OP == 'Add'
         shell: bash
@@ -246,6 +266,7 @@ jobs:
           if [ "$REMOVED" -lt "$COUNT" ]; then
             echo "Warning: Only removed $REMOVED runner(s) (others were busy or not found)."
           fi
+
 
 
 
