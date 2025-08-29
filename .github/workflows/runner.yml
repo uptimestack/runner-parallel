@@ -16,12 +16,13 @@ on:
         type: number
         default: 1
       operation:
-        description: "Add or Subtract"
+        description: "Intended Operation"
         required: true
         type: choice
         options:
           - Add
           - Subtract
+          - Total
 
 jobs:
   manage:
@@ -245,6 +246,7 @@ jobs:
           if [ "$REMOVED" -lt "$COUNT" ]; then
             echo "Warning: Only removed $REMOVED runner(s) (others were busy or not found)."
           fi
+
 
 
 
